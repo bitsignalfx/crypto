@@ -5,11 +5,9 @@ const technicalindicators = require("technicalindicators");
 // Konfigurasi Bot & Finnhub
 const BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";
 const FINNHUB_TOKEN = "YOUR_FINNHUB_WEBSOCKET_TOKEN";
-const FREE_GROUP_ID = "-100XXXXXXXXX";  // Ganti dengan ID grup gratis
-const PREMIUM_GROUP_ID = "-100XXXXXXXXX";  // Ganti dengan ID grup premium
+const FREE_GROUP_ID = "-100XXXXXXXXX";
+const PREMIUM_GROUP_ID = "-100XXXXXXXXX";
 const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`);
-
-// Inisialisasi bot
 const bot = new Telegraf(BOT_TOKEN);
 
 // Buffer data harga
@@ -24,59 +22,70 @@ let newsActive = false;
 // Fungsi membuat kode sinyal unik
 const generateSignalCode = () => `CR${Math.floor(1000 + Math.random() * 9000)}`;
 
-// Fungsi untuk menghitung indikator teknikal
+// Fungsi menghitung ATR
+const calculateATR = (period = 14) => {
+  if (priceData.length < period) return null;
+  const highs = priceData.map(p => p.high);
+  const lows = priceData.map(p => p.low);
+  const closes = priceData.map(p => p.close);
+  return technicalindicators.ATR.calculate({ period, high: highs, low: lows, close: closes });
+};
+
+// Fungsi mengecek pola candlestick
+const checkCandlestickPatterns = () => {
+  if (priceData.length < 3) return null;
+  const lastCandle = priceData[priceData.length - 1];
+  const prevCandle = priceData[priceData.length - 2];
+
+  if (lastCandle.close > lastCandle.open && prevCandle.close < prevCandle.open && lastCandle.close > prevCandle.open) {
+    return "BULLISH_ENGULFING";
+  }
+  if (lastCandle.close < lastCandle.open && prevCandle.close > prevCandle.open && lastCandle.close < prevCandle.open) {
+    return "BEARISH_ENGULFING";
+  }
+  return null;
+};
+
+// Fungsi menghitung indikator teknikal
 const calculateIndicators = () => {
   if (priceData.length < 200) return null;
 
   const closePrices = priceData.map((p) => p.close);
   const volumes = priceData.map((p) => p.volume);
+  const atr = calculateATR();
 
   return {
     ema50: technicalindicators.EMA.calculate({ period: 50, values: closePrices }),
     ema200: technicalindicators.EMA.calculate({ period: 200, values: closePrices }),
-    macd: technicalindicators.MACD.calculate({
-      values: closePrices,
-      fastPeriod: 12,
-      slowPeriod: 26,
-      signalPeriod: 9,
-    }),
+    macd: technicalindicators.MACD.calculate({ values: closePrices, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 }),
     rsi: technicalindicators.RSI.calculate({ period: 14, values: closePrices }),
     obv: technicalindicators.OBV.calculate({ close: closePrices, volume: volumes }),
-    rvol: calculateRelativeVolume(volumes),
+    atr: atr ? atr[atr.length - 1] : null,
   };
 };
 
-// Fungsi menghitung Relative Volume (RVOL)
-const calculateRelativeVolume = (volumes) => {
-  if (volumes.length < 50) return null;
-
-  const currentVolume = volumes[volumes.length - 1];
-  const avgVolume = volumes.slice(-50).reduce((a, b) => a + b, 0) / 50;
-
-  return currentVolume / avgVolume;
-};
-
-// Fungsi menentukan sinyal beli/jual dengan filter OBV & RVOL
+// Fungsi menentukan sinyal beli/jual dengan filter tambahan
 const detectSignal = () => {
   const indicators = calculateIndicators();
   if (!indicators) return null;
 
-  const { ema50, ema200, macd, rsi, obv, rvol } = indicators;
+  const { ema50, ema200, macd, rsi, obv, atr } = indicators;
   const lastEMA50 = ema50[ema50.length - 1];
   const lastEMA200 = ema200[ema200.length - 1];
   const lastMACD = macd[macd.length - 1];
   const lastRSI = rsi[rsi.length - 1];
   const lastOBV = obv[obv.length - 1];
   const prevOBV = obv[obv.length - 2];
-  const lastRVOL = rvol;
+  const candlePattern = checkCandlestickPatterns();
 
   const obvConfirm = lastOBV > prevOBV;
-  const rvolConfirm = lastRVOL > 1;
+  const atrConfirm = atr && atr > 3;
+  const candleConfirm = candlePattern === "BULLISH_ENGULFING" || candlePattern === "BEARISH_ENGULFING";
 
-  if (lastEMA50 > lastEMA200 && lastMACD.histogram > 0 && lastRSI > 50 && obvConfirm && rvolConfirm) {
+  if (lastEMA50 > lastEMA200 && lastMACD.histogram > 0 && lastRSI > 50 && obvConfirm && atrConfirm && candleConfirm) {
     return "BUY";
   }
-  if (lastEMA50 < lastEMA200 && lastMACD.histogram < 0 && lastRSI < 50 && !obvConfirm && rvolConfirm) {
+  if (lastEMA50 < lastEMA200 && lastMACD.histogram < 0 && lastRSI < 50 && !obvConfirm && atrConfirm && candleConfirm) {
     return "SELL";
   }
 
@@ -87,13 +96,10 @@ const detectSignal = () => {
 const sendSignal = async (type) => {
   const signalCode = generateSignalCode();
   const lastPrice = priceData[priceData.length - 1].close;
-
-  const pipValue = 1.0; // BTC/USD menggunakan pip = 1.0
-  const tpPips = 200;
-  const slPips = 300;
-
-  const tp = type === "BUY" ? lastPrice + tpPips * pipValue : lastPrice - tpPips * pipValue;
-  const sl = type === "BUY" ? lastPrice - slPips * pipValue : lastPrice + slPips * pipValue;
+  const atr = calculateATR();
+  const atrMultiplier = 1.5;
+  const tp = type === "BUY" ? lastPrice + (atr * atrMultiplier) : lastPrice - (atr * atrMultiplier);
+  const sl = type === "BUY" ? lastPrice - (atr * atrMultiplier * 1.5) : lastPrice + (atr * atrMultiplier * 1.5);
 
   const message = `🔹 **Signal ${type} BTC/USD** 🔹
 📌 Kode: ${signalCode}
@@ -123,39 +129,22 @@ ws.on("open", () => {
 ws.on("message", (data) => {
   const response = JSON.parse(data);
 
-  // Update harga
   if (response.type === "trade") {
-    response.data.forEach((trade) => {
-      priceData.push({ close: trade.p, volume: trade.v });
-      if (priceData.length > MAX_DATA_POINTS) priceData.shift();
-    });
+    const latestTrade = response.data[response.data.length - 1];
+    priceData.push({ close: latestTrade.p, volume: latestTrade.v, high: latestTrade.h, low: latestTrade.l });
 
+    if (priceData.length > MAX_DATA_POINTS) priceData.shift();
     if (isAnalyzing && !newsActive) {
       const signal = detectSignal();
       if (signal) sendSignal(signal);
     }
   }
 
-  // Filter news dari Finnhub
-  if (response.type === "news") {
+  if (response.type === "economic_calendar" && response.data.impact === "high") {
     newsActive = true;
-    console.log("📢 News detected, stopping analysis for 15 minutes...");
-    setTimeout(() => (newsActive = false), 15 * 60 * 1000);
+    console.log("📢 High-impact news detected. Stopping analysis for 20 minutes...");
+    setTimeout(() => (newsActive = false), 20 * 60 * 1000);
   }
-});
-
-// Fungsi reset analisis setelah sinyal selesai
-const resetAnalysis = () => {
-  lastSignal = null;
-  setTimeout(() => {
-    isAnalyzing = true;
-    console.log("✅ Bot siap analisis lagi.");
-  }, 2 * 60 * 1000);
-};
-
-// Perintah bot untuk cek status
-bot.command("status", (ctx) => {
-  ctx.reply(`🤖 Bot Aktif\n📊 Analisis: ${isAnalyzing ? "✅ ON" : "⏸️ PAUSE"}\n📰 News Filter: ${newsActive ? "🛑 Aktif" : "✅ Tidak Ada News"}`);
 });
 
 // Jalankan bot
