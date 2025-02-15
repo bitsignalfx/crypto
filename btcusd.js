@@ -1,152 +1,141 @@
-const { Telegraf } = require("telegraf");
-const WebSocket = require("ws");
-const technicalindicators = require("technicalindicators");
+require('dotenv').config();
+const WebSocket = require('ws');
+const { Telegraf } = require('telegraf');
+const ti = require('technicalindicators');
 
-// Konfigurasi Bot & Finnhub
-const BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN";
-const FINNHUB_TOKEN = "YOUR_FINNHUB_WEBSOCKET_TOKEN";
-const FREE_GROUP_ID = "-100XXXXXXXXX";
-const PREMIUM_GROUP_ID = "-100XXXXXXXXX";
-const ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`);
-const bot = new Telegraf(BOT_TOKEN);
+// Konfigurasi bot Telegram
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Buffer data harga
-let priceData = [];
-const MAX_DATA_POINTS = 500;
+// WebSocket Finnhub
+const ws = new WebSocket(`wss://ws.finnhub.io?token=${process.env.FINNHUB_API_KEY}`);
 
-// Variabel kontrol sinyal
-let isAnalyzing = true;
-let lastSignal = null;
-let newsActive = false;
+// Variabel penyimpanan data harga
+let prices = [];
+let isTradeActive = false; // Bot berhenti analisis setelah sinyal terkirim
 
-// Fungsi membuat kode sinyal unik
-const generateSignalCode = () => `CR${Math.floor(1000 + Math.random() * 9000)}`;
-
-// Fungsi menghitung ATR
-const calculateATR = (period = 14) => {
-  if (priceData.length < period) return null;
-  const highs = priceData.map(p => p.high);
-  const lows = priceData.map(p => p.low);
-  const closes = priceData.map(p => p.close);
-  return technicalindicators.ATR.calculate({ period, high: highs, low: lows, close: closes });
-};
-
-// Fungsi mengecek pola candlestick
-const checkCandlestickPatterns = () => {
-  if (priceData.length < 3) return null;
-  const lastCandle = priceData[priceData.length - 1];
-  const prevCandle = priceData[priceData.length - 2];
-
-  if (lastCandle.close > lastCandle.open && prevCandle.close < prevCandle.open && lastCandle.close > prevCandle.open) {
-    return "BULLISH_ENGULFING";
-  }
-  if (lastCandle.close < lastCandle.open && prevCandle.close > prevCandle.open && lastCandle.close < prevCandle.open) {
-    return "BEARISH_ENGULFING";
-  }
-  return null;
-};
-
-// Fungsi menghitung indikator teknikal
-const calculateIndicators = () => {
-  if (priceData.length < 200) return null;
-
-  const closePrices = priceData.map((p) => p.close);
-  const volumes = priceData.map((p) => p.volume);
-  const atr = calculateATR();
-
-  return {
-    ema50: technicalindicators.EMA.calculate({ period: 50, values: closePrices }),
-    ema200: technicalindicators.EMA.calculate({ period: 200, values: closePrices }),
-    macd: technicalindicators.MACD.calculate({ values: closePrices, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 }),
-    rsi: technicalindicators.RSI.calculate({ period: 14, values: closePrices }),
-    obv: technicalindicators.OBV.calculate({ close: closePrices, volume: volumes }),
-    atr: atr ? atr[atr.length - 1] : null,
-  };
-};
-
-// Fungsi menentukan sinyal beli/jual dengan filter tambahan
-const detectSignal = () => {
-  const indicators = calculateIndicators();
-  if (!indicators) return null;
-
-  const { ema50, ema200, macd, rsi, obv, atr } = indicators;
-  const lastEMA50 = ema50[ema50.length - 1];
-  const lastEMA200 = ema200[ema200.length - 1];
-  const lastMACD = macd[macd.length - 1];
-  const lastRSI = rsi[rsi.length - 1];
-  const lastOBV = obv[obv.length - 1];
-  const prevOBV = obv[obv.length - 2];
-  const candlePattern = checkCandlestickPatterns();
-
-  const obvConfirm = lastOBV > prevOBV;
-  const atrConfirm = atr && atr > 3;
-  const candleConfirm = candlePattern === "BULLISH_ENGULFING" || candlePattern === "BEARISH_ENGULFING";
-
-  if (lastEMA50 > lastEMA200 && lastMACD.histogram > 0 && lastRSI > 50 && obvConfirm && atrConfirm && candleConfirm) {
-    return "BUY";
-  }
-  if (lastEMA50 < lastEMA200 && lastMACD.histogram < 0 && lastRSI < 50 && !obvConfirm && atrConfirm && candleConfirm) {
-    return "SELL";
-  }
-
-  return null;
-};
-
-// Fungsi mengirim sinyal ke Telegram
-const sendSignal = async (type) => {
-  const signalCode = generateSignalCode();
-  const lastPrice = priceData[priceData.length - 1].close;
-  const atr = calculateATR();
-  const atrMultiplier = 1.5;
-  const tp = type === "BUY" ? lastPrice + (atr * atrMultiplier) : lastPrice - (atr * atrMultiplier);
-  const sl = type === "BUY" ? lastPrice - (atr * atrMultiplier * 1.5) : lastPrice + (atr * atrMultiplier * 1.5);
-
-  const message = `🔹 **Signal ${type} BTC/USD** 🔹
-📌 Kode: ${signalCode}
-📈 Entry: ${lastPrice.toFixed(2)}
-🎯 TP: ${tp.toFixed(2)}
-🛑 SL: ${sl.toFixed(2)}`;
-
-  try {
-    await bot.telegram.sendMessage(PREMIUM_GROUP_ID, message, { parse_mode: "Markdown" });
-    if (!lastSignal) {
-      await bot.telegram.sendMessage(FREE_GROUP_ID, message, { parse_mode: "Markdown" });
-    }
-    lastSignal = signalCode;
-    isAnalyzing = false;
-    console.log(`✅ Sinyal ${type} terkirim.`);
-  } catch (error) {
-    console.error("❌ Gagal mengirim sinyal:", error);
-  }
-};
-
-// Event WebSocket Finnhub untuk harga & news
-ws.on("open", () => {
-  ws.send(JSON.stringify({ type: "subscribe", symbol: "BINANCE:BTCUSDT" }));
-  ws.send(JSON.stringify({ type: "subscribe", symbol: "economic_calendar" }));
+// Subscribe ke BTC/USD
+ws.on('open', function open() {
+    ws.send(JSON.stringify({ type: 'subscribe', symbol: 'BINANCE:BTCUSDT' }));
 });
 
-ws.on("message", (data) => {
-  const response = JSON.parse(data);
-
-  if (response.type === "trade") {
-    const latestTrade = response.data[response.data.length - 1];
-    priceData.push({ close: latestTrade.p, volume: latestTrade.v, high: latestTrade.h, low: latestTrade.l });
-
-    if (priceData.length > MAX_DATA_POINTS) priceData.shift();
-    if (isAnalyzing && !newsActive) {
-      const signal = detectSignal();
-      if (signal) sendSignal(signal);
+// Fungsi untuk mengirim pesan ke Telegram
+async function sendTelegramMessage(message) {
+    try {
+        await bot.telegram.sendMessage(CHAT_ID, message);
+    } catch (error) {
+        console.error("Telegram Error:", error);
     }
-  }
+}
 
-  if (response.type === "economic_calendar" && response.data.impact === "high") {
-    newsActive = true;
-    console.log("📢 High-impact news detected. Stopping analysis for 20 minutes...");
-    setTimeout(() => (newsActive = false), 20 * 60 * 1000);
-  }
+// Fungsi menghitung indikator
+function calculateIndicators(data) {
+    const closePrices = data.map(item => item.close);
+
+    const ema21 = ti.EMA.calculate({ period: 21, values: closePrices });
+    const ema50 = ti.EMA.calculate({ period: 50, values: closePrices });
+    const bb = ti.BollingerBands.calculate({ period: 20, values: closePrices, stdDev: 2 });
+    const macd = ti.MACD.calculate({ 
+        values: closePrices, 
+        fastPeriod: 12, 
+        slowPeriod: 26, 
+        signalPeriod: 9, 
+        SimpleMAOscillator: false, 
+        SimpleMASignal: false 
+    });
+    const rsi = ti.RSI.calculate({ period: 14, values: closePrices });
+
+    return {
+        ema21: ema21[ema21.length - 1],
+        ema50: ema50[ema50.length - 1],
+        bbUpper: bb[bb.length - 1]?.upper,
+        bbLower: bb[bb.length - 1]?.lower,
+        macdHist: macd[macd.length - 1]?.histogram,
+        rsi: rsi[rsi.length - 1]
+    };
+}
+
+// Menentukan level support/resistance (sederhana)
+function findSupportResistance(data) {
+    const closePrices = data.map(item => item.close);
+    const minPrice = Math.min(...closePrices);
+    const maxPrice = Math.max(...closePrices);
+
+    return { support: minPrice, resistance: maxPrice };
+}
+
+// Menentukan sinyal buy/sell
+function checkForSignal(data) {
+    const { ema21, ema50, bbUpper, bbLower, macdHist, rsi } = calculateIndicators(data);
+    const { support, resistance } = findSupportResistance(data);
+    const lastPrice = data[data.length - 1].close;
+
+    if (!ema21 || !ema50 || !bbUpper || !bbLower || !macdHist || !rsi) return;
+
+    let signal = null;
+    let tp = null;
+    let sl = null;
+
+    // **BUY Signal**
+    if (ema21 > ema50 && macdHist > 0 && rsi < 70 && lastPrice > support) {
+        signal = "BUY";
+        tp = lastPrice + 200;
+        sl = lastPrice - 300;
+    }
+
+    // **SELL Signal**
+    if (ema21 < ema50 && macdHist < 0 && rsi > 30 && lastPrice < resistance) {
+        signal = "SELL";
+        tp = lastPrice - 200;
+        sl = lastPrice + 300;
+    }
+
+    // Kirim sinyal jika valid dan belum ada posisi aktif
+    if (signal && !isTradeActive) {
+        isTradeActive = true;
+        sendTelegramMessage(`🚀 *BTCUSD ${signal} Signal*\n\n📉 Entry: ${lastPrice}\n🎯 TP: ${tp}\n🛑 SL: ${sl}`);
+        
+        // Pantau harga sampai TP atau SL tercapai
+        monitorTrade(signal, tp, sl);
+    }
+}
+
+// Pantau trade sampai TP/SL tercapai
+function monitorTrade(signal, tp, sl) {
+    const interval = setInterval(() => {
+        if (prices.length === 0) return;
+
+        const lastPrice = prices[prices.length - 1].close;
+
+        if ((signal === "BUY" && lastPrice >= tp) || (signal === "SELL" && lastPrice <= tp)) {
+            sendTelegramMessage(`✅ *BTCUSD ${signal} TP Hit!*\n\n📈 Price: ${lastPrice}`);
+            isTradeActive = false;
+            clearInterval(interval);
+        } else if ((signal === "BUY" && lastPrice <= sl) || (signal === "SELL" && lastPrice >= sl)) {
+            sendTelegramMessage(`❌ *BTCUSD ${signal} SL Hit!*\n\n📉 Price: ${lastPrice}`);
+            isTradeActive = false;
+            clearInterval(interval);
+        }
+    }, 5000); // Cek harga setiap 5 detik
+}
+
+// Event listener WebSocket
+ws.on('message', function incoming(data) {
+    const parsedData = JSON.parse(data);
+    if (parsedData.type === "trade") {
+        parsedData.data.forEach(trade => {
+            prices.push({ time: trade.t, close: trade.p });
+
+            // Simpan maksimal 100 data terakhir
+            if (prices.length > 100) prices.shift();
+
+            // Cek sinyal hanya jika ada cukup data
+            if (prices.length >= 50 && !isTradeActive) {
+                checkForSignal(prices);
+            }
+        });
+    }
 });
 
-// Jalankan bot
+// Menjalankan bot Telegram
 bot.launch();
-console.log("🚀 Bot berjalan...");
